@@ -17,11 +17,12 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.agents import create_agent
+from langchain_core.messages import ToolMessage
 
 import openai
 import json
 import warnings
-import pprintpp
+from pprintpp import pprint as pp
 
 def enable_logging():
     import logging
@@ -104,6 +105,16 @@ def create_databricks_client(config: DatabricksConfig) -> openai.OpenAI:
     )
 
     return llm, llm_noreason, databricks_embeddings
+
+def get_tool_agent_instance(llm, tools):
+    """Create an agent instance with the given LLM and tools."""
+    agent = create_agent(llm=llm, tools=tools)
+    return agent
+
+def get_agent_instance(llm):
+    """Create an agent instance with the given LLM and tools."""
+    agent = create_agent(llm)
+    return agent
 
 def bootstrap_notebook(validate: bool = True):
     """Return notebook-ready variables: token, host, endpoint, and configured client."""

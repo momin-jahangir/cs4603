@@ -21,3 +21,4 @@ bs4
 markitdown 
 streamlit
 streamlit-chat
+tavily-python
