@@ -15,14 +15,23 @@ Prerequisites:
   - Running inside a Databricks notebook with workspace auth
   - .env file with DATABRICKS_TOKEN, DATABRICKS_HOST, DATABRICKS_MODEL
 
+  To deploy with a specific workspace, authenticate and create a profile
+  FIRST, then pass it with --profile:
+      databricks auth login --host https://<workspace>.databricks.com --profile my-profile
+      databricks auth profiles          # verify it was created
+
 Usage (from repo root):
-    python wk5_langgraph/11.databricks_deployment/deploy_setup.py
+    # --api-key is REQUIRED: a PAT for the target workspace's serving endpoints.
+    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --api-key dapi...
 
     # Or with custom model name:
-    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --model-name my_agent
+    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --api-key dapi... --model-name my_agent
 
     # Skip endpoint creation (just register model):
-    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --skip-endpoint
+    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --api-key dapi... --skip-endpoint
+
+    # Authenticate with a specific Databricks CLI profile instead of .env:
+    python wk5_langgraph/11.databricks_deployment/deploy_setup.py --profile my-profile --api-key dapi...
 """
 
 import argparse
@@ -38,6 +47,8 @@ parser = argparse.ArgumentParser(description="Set up Databricks prerequisites fo
 parser.add_argument("--model-name", default="main.default.cs4603_langgraph_agent", help="Unity Catalog model path (default: main.default.cs4603_langgraph_agent)")
 parser.add_argument("--endpoint-name", default="cs4603-langgraph-agent", help="Serving endpoint name (default: cs4603-langgraph-agent)")
 parser.add_argument("--skip-endpoint", action="store_true", help="Skip creating the serving endpoint")
+parser.add_argument("--profile", default=None, help="Databricks CLI profile (~/.databrickscfg) to deploy with. Overrides DATABRICKS_HOST/TOKEN from .env for this run; .env is still used to run the notebooks.")
+parser.add_argument("--api-key", required=True, help="Databricks personal access token (PAT) for the TARGET workspace's model serving endpoints. Required because a profile using OAuth login has no static token for the agent's LLM client to use.")
 args = parser.parse_args()
 
 MODEL_REGISTRY_NAME = args.model_name
@@ -51,16 +62,58 @@ print("=" * 60)
 from langchain_common import bootstrap_notebook
 
 DATABRICKS_TOKEN, DATABRICKS_HOST, DATABRICKS_MODEL, (llm, llm_noreason), embeddings = bootstrap_notebook()
-print(f"\n  Databricks host: {DATABRICKS_HOST}")
-print(f"  Model endpoint:  {DATABRICKS_MODEL}")
+
+# When --profile is given, authenticate via the named Databricks CLI profile
+# (~/.databrickscfg) instead of the DATABRICKS_HOST/TOKEN loaded from .env.
+# The .env values remain the default so students can still run the notebooks.
+USE_PROFILE = args.profile is not None
+if USE_PROFILE:
+    print(f"\n  Auth: Databricks CLI profile '{args.profile}' (overrides .env)")
+    # bootstrap_notebook() called load_dotenv(), which sets DATABRICKS_HOST/TOKEN
+    # in the environment. The Databricks SDK ranks env vars ABOVE profiles, so
+    # they would silently override --profile. Remove them so the profile wins.
+    for _var in ("DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CONFIG_PROFILE"):
+        os.environ.pop(_var, None)
+else:
+    print(f"\n  Auth: DATABRICKS_HOST/TOKEN from .env")
 
 # Check for Databricks SDK availability (used for serving endpoint creation)
 try:
     from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
+    if USE_PROFILE:
+        w = WorkspaceClient(profile=args.profile)
+        # Use the profile's host for display, URLs, and any REST fallbacks
+        DATABRICKS_HOST = w.config.host
+    else:
+        w = WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
     HAS_SDK = True
 except ImportError:
+    if USE_PROFILE:
+        print("  ✗ --profile requires the databricks-sdk package. Install it and retry.")
+        sys.exit(1)
     HAS_SDK = False
+
+print(f"  Databricks host: {DATABRICKS_HOST}")
+print(f"  Model endpoint:  {DATABRICKS_MODEL}")
+
+# Rebuild the agent's LLM clients using the explicitly provided --api-key and the
+# resolved host. bootstrap_notebook() built these from .env; when deploying to a
+# different workspace (e.g. via --profile with OAuth login) those baked-in
+# credentials are wrong, so re-create the clients against the target workspace.
+from langchain_common import DatabricksConfig, create_databricks_client
+
+DATABRICKS_TOKEN = args.api_key
+_model_cfg = DatabricksConfig(token=DATABRICKS_TOKEN, host=DATABRICKS_HOST, endpoint=DATABRICKS_MODEL)
+llm, llm_noreason, embeddings = create_databricks_client(_model_cfg)
+print(f"  Model auth:      --api-key (PAT) against {DATABRICKS_HOST}")
+
+# agent.py (imported below, and logged via models-from-code) builds its OWN
+# ChatOpenAI from these env vars at import time. When --profile popped them,
+# re-set them to the resolved target workspace + --api-key so the agent's model
+# client can authenticate here and at serving time.
+os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
+os.environ["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
+os.environ["DATABRICKS_MODEL"] = DATABRICKS_MODEL
 
 # ─── Step 1: Quick sanity check of the agent ─────────────────────────────────
 
@@ -121,22 +174,29 @@ print(f"{'─'*60}")
 import mlflow
 import os
 
-# Point MLflow at the Databricks workspace from .env (not local sqlite)
-os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
-os.environ["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
-mlflow.set_tracking_uri("databricks")
+if USE_PROFILE:
+    # Route MLflow tracking through the CLI profile (reads ~/.databrickscfg)
+    mlflow.set_tracking_uri(f"databricks://{args.profile}")
+else:
+    # Point MLflow at the Databricks workspace from .env (not local sqlite)
+    os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
+    os.environ["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
+    mlflow.set_tracking_uri("databricks")
 
 print(f"  MLflow tracking: {mlflow.get_tracking_uri()}")
 print(f"  Target host:     {DATABRICKS_HOST}")
 
 # Resolve the current user's home folder for the experiment
-import requests
 try:
-    resp = requests.get(
-        f"{DATABRICKS_HOST.rstrip('/')}/api/2.0/preview/scim/v2/Me",
-        headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
-    )
-    db_username = resp.json().get("userName", "unknown")
+    if HAS_SDK:
+        db_username = w.current_user.me().user_name
+    else:
+        import requests
+        resp = requests.get(
+            f"{DATABRICKS_HOST.rstrip('/')}/api/2.0/preview/scim/v2/Me",
+            headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+        )
+        db_username = resp.json().get("userName", "unknown")
 except Exception:
     db_username = "unknown"
 
@@ -152,7 +212,7 @@ print(f"  Model code:      {model_code_path}")
 with mlflow.start_run(run_name="langgraph-agent-setup") as run:
     model_info = mlflow.langchain.log_model(
         lc_model=model_code_path,
-        artifact_path="langgraph_agent",
+        name="langgraph_agent",
         input_example={"messages": [{"role": "user", "content": "Add 2 and 3."}]},
     )
     run_id = run.info.run_id
@@ -168,7 +228,7 @@ print(f"  Name: {MODEL_REGISTRY_NAME}")
 print(f"{'─'*60}")
 
 try:
-    mlflow.set_registry_uri("databricks-uc")
+    mlflow.set_registry_uri(f"databricks-uc://{args.profile}" if USE_PROFILE else "databricks-uc")
 
     registered = mlflow.register_model(
         model_uri=model_info.model_uri,
